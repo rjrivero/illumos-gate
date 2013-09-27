@@ -56,7 +56,6 @@
 #include <sys/t_lock.h>
 #include <sys/debug.h>
 #include <sys/atomic.h>
-#include <sys/sysmacros.h>
 
 #include <sys/fs/lofs_node.h>
 #include <sys/fs/lofs_info.h>

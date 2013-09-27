@@ -524,16 +524,85 @@ lo_sync(struct vfs *vfsp,
 static int
 lo_vget(struct vfs *vfsp, struct vnode **vpp, struct fid *fidp)
 {
-	vnode_t *realrootvp;
+	struct vnode * rvp = NULL;
+	struct vfs * rvfsp = NULL;
+	struct loinfo * li = vtoli(vfsp);
+	int error = 0;
+	int rele  = 0;
 
 #ifdef LODEBUG
 	lo_dprint(4, "lo_vget: %p\n", vfsp);
 #endif
-	(void) lo_realvfs(vfsp, &realrootvp);
-	if (realrootvp != NULL)
-		return (VFS_VGET(realrootvp->v_vfsp, vpp, fidp));
-	else
-		return (EIO);
+	if ((li->li_flag & LO_NOSUB) || (fidp->fid_len <= LOFIDSIZE)) {
+		/*
+		 * The fidp cannot contain a lofid_t object if
+		 * NOSUB is enabled, or the buffer is too short.
+		 * The fid must belong to the current filesystem.
+		 */
+		goto current;
+	}
+
+	lofid_t * lfidp = (lofid_t *) fidp;
+	if (LOFIDSIZE + lfidp->lf_fid.fid_len != fidp->fid_len) {
+		/*
+		 * If total size of the lofid_t object and internal
+		 * size of the fid_t inner object do not match, the
+		 * fidp is not pointing to a valid lofid_t
+		 */
+		goto out;
+	}
+
+	fsid_t * fsidp = &(lfidp->lf_fsid);
+	fidp = &(lfidp->lf_fid);
+	/* Compare the fsid with the current vfs_fsid */
+	if(memcmp(fsidp, &vfsp->vfs_fsid, sizeof(fsid_t)) != 0) {
+		/*
+		 * If the fsid is different from the current vfsp,
+		 * get the filesystem straight from the kernel.
+		 * 
+		 * This DOES increment the reference count of the
+		 * filesystem, so we must VFS_RELE it later.
+		 */
+		rvfsp = getvfs(fsidp);
+		rele = 1;
+		/*
+		 * TODO: Make sure the real file system is mounted
+		 * below the lofs, to prevent users accessing
+		 * restricted filesystems through VFS_VGET.
+		 */
+		goto out;
+	}
+
+	/*
+	 * if we reach here, the lf_fsid has matched the
+	 * vfs_fsid, so the fid belongs to the current lofs.
+	 */
+
+current:
+	/* 
+	 * Get the real vfs of the current lofs. This does
+	 * not increment the reference count in vfsp,
+	 * rvp nor rvfsp.
+	 */
+	(void) lo_realvfs(vfsp, &rvp);
+
+out:
+	if (rvp != NULL) {
+		/* Keep the original semantics */
+		rvfsp = rvp->v_vfsp;
+	}
+	if (rvfsp == NULL)
+		error = (EIO);
+	else {
+		error = VFS_VGET(rvfsp, &rvp, fidp);
+		if (error == 0 && rvp != NULL) {
+			/* VFS_VGET returns a hold vnode */
+			*vpp = makelonode(rvp, li, 0);
+		}
+		if (rele)
+			VFS_RELE(rvfsp);
+	}
+	return error;
 }
 
 /*

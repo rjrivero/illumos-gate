@@ -239,11 +239,59 @@ lo_inactive(vnode_t *vp, struct cred *cr, caller_context_t *ct)
 static int
 lo_fid(vnode_t *vp, struct fid *fidp, caller_context_t *ct)
 {
+	struct loinfo * li = vtoli(vp->v_vfsp);
+	vnode_t * rvp = realvp(vp);
+	int nosub = (li->li_flag & LO_NOSUB);
+	int rflen = fidp->fid_len;
+
 #ifdef LODEBUG
-	lo_dprint(4, "lo_fid %p, realvp %p\n", vp, realvp(vp));
+	lo_dprint(4, "lo_fid %p, realvp %p\n", vp, rvp);
 #endif
-	vp = realvp(vp);
-	return (VOP_FID(vp, fidp, ct));
+	int error = VOP_FID(rvp, fidp, ct);
+	int lflen = fidp->fid_len;
+
+	if (nosub || (error != 0 && error != (ENOSPC)))
+		goto out;
+
+	/* Check if we should append the FSID to the FID.
+	 * We append if:
+	 * 
+	 * - The filesystem is not the root fs OR
+	 * - The fid size is larger than LOF_MAXFID.
+	 * 
+	 * This is our way to try to avoid growing the FID when the
+	 * filesystem below has taken the effort to make it short
+	 * enough to fit it in an NFSv2 fhandle_t.
+	 */
+	if ((lflen <= LOFIDSIZE) && (vp->v_vfsp == li->li_mountvfs))
+		goto out;
+
+	lflen += LOFIDSIZE;
+	if (lflen > rflen) {
+		/* Tell the caller to grow the buffer */
+		error = (ENOSPC);
+	}
+	if (error)
+		goto out;
+
+	/*
+	 * finally, put the fid and fsid in the right places
+	 */
+	lofid_t * lfidp = (lofid_t *) fidp;
+	memmove(
+		((void *) &(lfidp->lf_fid)),
+		((void *) fidp),
+		offsetof(fid_t, fid_data) + fidp->fid_len
+	);
+	memcpy(
+		((void *) &(lfidp->lf_fsid)),
+		((void *) &(rvp->v_vfsp->vfs_fsid)),
+		sizeof(fsid_t)
+	);
+
+out:
+	fidp->fid_len = lflen;
+	return error;
 }
 
 /*

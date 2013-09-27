@@ -32,6 +32,7 @@
 
 #ifdef _KERNEL
 #include <sys/vfs_opreg.h>
+#include <sys/sysmacros.h>
 #endif
 
 #ifdef	__cplusplus
@@ -107,7 +108,19 @@ struct lfsnode {
 
 #define	vtoli(VFSP)	((struct loinfo *)((VFSP)->vfs_data))
 
+/*
+ * fileid (fid_t) sub-structure
+ */
+typedef struct lofid {
+	ushort_t len;
+	fsid_t lf_fsid;
+	fid_t  lf_fid;
+} lofid_t;
+ 
 #ifdef _KERNEL
+
+#define LOFIDSIZE offsetof(lofid_t, lf_fid.fid_data)
+
 extern struct vfs *lo_realvfs(struct vfs *, struct vnode **);
 extern void lofs_subrinit(void);
 extern void lofs_subrfini(void);
