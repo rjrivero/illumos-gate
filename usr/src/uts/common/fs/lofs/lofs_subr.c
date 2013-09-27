@@ -56,6 +56,7 @@
 #include <sys/t_lock.h>
 #include <sys/debug.h>
 #include <sys/atomic.h>
+#include <sys/sysmacros.h>
 
 #include <sys/fs/lofs_node.h>
 #include <sys/fs/lofs_info.h>
@@ -470,17 +471,10 @@ lo_realvfs(struct vfs *vfsp, struct vnode **realrootvpp)
 			*realrootvpp = vtol(li->li_rootvp)->lo_vp;
 		return (li->li_realvfs);
 	}
-	mutex_enter(&li->li_lfslock);
-	for (lfs = li->li_lfs; lfs != NULL; lfs = lfs->lfs_next) {
-		if (vfsp == &lfs->lfs_vfs) {
-			if (realrootvpp != NULL)
-				*realrootvpp = lfs->lfs_realrootvp;
-			mutex_exit(&li->li_lfslock);
-			return (lfs->lfs_realvfs);
-		}
-	}
-	panic("lo_realvfs");
-	/*NOTREACHED*/
+	lfs = (struct lfsnode *) container_of(vfsp, struct lfsnode, lfs_vfs);
+	if (realrootvpp != NULL)
+		*realrootvpp = lfs->lfs_realrootvp;
+	return lfs->lfs_realvfs;
 }
 
 /*
