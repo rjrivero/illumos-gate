@@ -82,20 +82,24 @@ typedef struct {
 	 * - Higher 32 bits: maximum burst size.
 	 */
 	uint64_t vma_control;
-	/* maximum allowed delay */
+	/* maximum allowed delay (nanosecs) */
 	uint64_t vma_timeout;
 } vma_tbucket_t;
 
 /* Number of bits of the step size part of the control field */
 #define VMA_TBUCKET_STEPBITS	32
 #define VMA_TBUCKET_STEPMASK	((1ll << VMA_TBUCKET_STEPBITS) - 1)
-/* Step size */
+/* Step size (nanosecs)  */
 #define VMA_TBUCKET_STEP(c)	((c) & VMA_TBUCKET_STEPMASK)
 /* Burst size */
 #define VMA_TBUCKET_BURST(c)	((c) >> VMA_TBUCKET_STEPBITS)
-/* Recompose the control word from rate and burst */
-#define VMA_TBUCKET_CONTROL(r, b)	\
-	(((1000000000ul / (r)) & VMA_TBUCKET_STEPMASK) | (((uint64_t) (b)) << VMA_TBUCKET_STEPBITS))
+
+/* Recompose the control word from 16-bit rate and burst */
+inline uint64_t vma_tbucket_control(uint64_t rate, uint64_t burst)
+{
+	return ((burst << VMA_TBUCKET_STEPBITS) |
+		((1000000000ul / rate) & VMA_TBUCKET_STEPMASK));
+}
 
 /* Number of bits in the timestamp part of the bucket field */
 #define	VMA_TBUCKET_STAMPBITS	48
@@ -104,60 +108,79 @@ typedef struct {
 #define VMA_TBUCKET_STAMP(b)	((b) & VMA_TBUCKET_STAMPMASK)
 /* Tokens available */
 #define VMA_TBUCKET_TOKENS(b)	((b) >> VMA_TBUCKET_STAMPBITS)
-/* Recompose the deadline from stamp and tokens */
-#define VMA_TBUCKET_DEADLINE(s, t)	\
-	(((s) & VMA_TBUCKET_STAMPMASK) | (((uint64_t) (t)) << VMA_TBUCKET_STAMPBITS))
 
-/* Default timeout for token bucket (5 secs) */
+/* Recombines the deadline from 48-bit stamp and 16-bit tokens */
+inline uint64_t vma_tbucket_deadline(uint64_t stamp, uint64_t tokens)
+{
+	return ((tokens << VMA_TBUCKET_STAMPBITS) |
+		(stamp & VMA_TBUCKET_STAMPMASK));
+}
+
+/* Default timeout for token bucket (5 secs = 5*10^9 nanosecs) */
 #define	VMA_TBUCKET_TIMEOUT	5000000000ll
 /* Special token value to signal the packet should be dropped */
-#define VMA_TBUCKET_DROP	(~(1ll << 63))
+#define VMA_TBUCKET_DROP	(~(0ll))
 
 /* Initialize the token bucket */
-uint64_t vma_tbucket_init(vma_tbucket_t *tb, uint16_t rate, uint16_t burst, uint64_t timeout);
+void vma_tbucket_init(vma_tbucket_t *tb, uint16_t rate, uint16_t burst, uint64_t timeout);
 
-/*
- * Resets the token bucket parameters. The timeout can be
- * changed directly, there is no need to define a macro for it.
- */
-#define	vma_tbucket_reset(tb, rate, burst)	\
-	((tb)->vma_control = VMA_TBUCKET_CONTROL((rate), (burst)))
+/* Updates the token bucket rate, returns the burst size. */
+inline void vma_tbucket_setrate(vma_tbucket_t *tb,
+	uint64_t rate, uint64_t burst)
+{
+	if (rate > burst) burst = rate;
+	tb->vma_control = (rate == 0) ? 0 : vma_tbucket_control(rate, burst);
+}
+
+/* Updates the token bucket timeout. */
+inline void vma_tbucket_settimeout(vma_tbucket_t *tb, uint64_t timeout)
+{
+	tb->vma_timeout = (timeout > 0) ? timeout : VMA_TBUCKET_TIMEOUT;
+}
+
+/* Force get token, call only if rate != 0 */
+uint64_t vma_do_get_token(vma_tbucket_t *tb);
 
 /*
  * Get a token. Returns the nanosecs to delay I/O operation, or 
  * VMA_TBUCKET_DROP if delay exceeds timeout.
  */
-uint64_t vma_get_token(vma_tbucket_t *tb);
+inline uint64_t vma_get_token(vma_tbucket_t *tb)
+{
+	return ((tb->vma_control == 0) ? 0 : vma_do_get_token(tb));
+}
 
 /*********************
  * Per-VFS statistics
  *********************/
  
 typedef struct {
-	/* threads delayed because of I/O shaping: */
-	volatile uint32_t vma_delays;
-	/* drops due to I/O shaping: */
-	volatile uint32_t vma_drops;
 	/*
 	 * Latency added by I/O shaping and disk, microsecs:
 	 * - Higher 32 bits are disk latency.
 	 * - Lower 32 bits are I/O shaping latency.
 	 */
 	volatile uint64_t vma_latency;
+	/* threads delayed because of I/O shaping: */
+	volatile uint32_t vma_delays;
+	/* drops due to I/O shaping: */
+	volatile uint32_t vma_drops;
 } vma_stats_t;
 
 /* Number of bits of each latency sub-field */
 #define VMA_STATS_LATBITS	32
 #define VMA_STATS_LATMASK	((1ll << VMA_STATS_LATBITS) - 1)
 /* I/O Shaping latency */
-#define	VMA_STATS_SHAPING(latency)	\
-	((uint32_t) ((latency) & VMA_STATS_LATMASK))
+#define	VMA_STATS_SHAPING(lat)	((lat) & VMA_STATS_LATMASK)
 /* Disk latency */
-#define	VMA_STATS_DISK(latency)		\
-	((uint32_t) ((latency) >> VMA_STATS_LATBITS))
-/* Recombine shaping and disk latency into a 64-bit word */
-#define	VMA_STATS_LATENCY(shape, disk)	\
-	((((uint64_t) (disk)) << VMA_STATS_LATBITS) | ((shape) & VMA_STATS_LATMASK))
+#define	VMA_STATS_DISK(lat)	((lat) >> VMA_STATS_LATBITS)
+
+/* Recombine 32-bits shaping and disk latency into a 64-bit word */
+inline uint64_t vma_stats_latency(uint64_t shape, uint64_t disk)
+{
+	return ((shape & VMA_STATS_LATMASK) |
+		(disk << VMA_STATS_LATBITS));
+}
 
 /*
  * Update stats.
@@ -184,7 +207,7 @@ typedef struct {
  * Weight should be used consistently in all calls to update.
  */
 void vma_stats_update(vma_stats_t *sp, uint32_t weight,
-	uint64_t token, uint32_t disk);
+	uint64_t token, uint64_t disk);
 
 /* maximum number of bits of the weighting factor */
 #define VMA_STATS_WEIGHTBITS	32
@@ -200,17 +223,21 @@ typedef struct {
 #define	VMA_STATS_READ	0
 #define VMA_STATS_WRITE	1
 
-/* Initializes the stats object */
-void vma_rwstats_init(vma_rwstats_t *sp, uint32_t weight);
-
-/* Updates the rwstats object */
-#define vma_rwstats_update(sp, op, token, disk)	\
-	(vma_stats_update(&((sp)->vma_stats[op]), (sp)->vma_weight, (token), (disk)))
-
 /* Retrieves the read or write stat fields */
 #define	VMA_RWSTATS_OP(sp, op)	(&((sp)->vma_stats[(op)]))
 #define	VMA_RWSTATS_WRITE(sp)	VMA_RWSTATS_OP((sp), VMA_STATS_WRITE)
 #define	VMA_RWSTATS_READ(sp)	VMA_RWSTATS_OP((sp), VMA_STATS_READ)
+
+/* Initializes the stats object */
+void vma_rwstats_init(vma_rwstats_t *sp, uint32_t weight);
+
+/* Updates the rwstats object */
+inline void vma_rwstats_update(vma_rwstats_t *sp, int op,
+	uint64_t token, uint64_t disk)
+{
+	return vma_stats_update(VMA_RWSTATS_OP(sp, op),
+		sp->vma_weight, token, disk);
+}
 
 /***************************************************************
  * VMA FileSystem object
@@ -227,8 +254,8 @@ typedef struct vmafs {
 	vmafs_node_t	 vma_link;	/* Link to index by path */
 	vnode_t		*vma_realvp;	/* real root vp */
 	vfs_t		*vma_realvfs;	/* real vfs */
-	vma_rwstats_t	 vma_stats;	/* filesystem stats */
 	vma_tbucket_t	 vma_bucket;	/* token bucket */
+	vma_rwstats_t	 vma_stats;	/* filesystem stats */
 	vfs_t		 vma_vfs;	/* new loopback vfs */
 } vmafs_t;
 

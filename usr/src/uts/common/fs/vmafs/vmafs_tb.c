@@ -26,22 +26,23 @@
 
 /*
  * Initialize a token bucket.
+
  * - tb: the token bucket.
  * - rate: the rate at which tokens must be added to the bucket
  *   (tokens per second)
  * - burst: the maximum burst size (tokens).
  */
-uint64_t vma_tbucket_init(vma_tbucket_t *tb, uint16_t rate, uint16_t burst, uint64_t timeout)
+void vma_tbucket_init(vma_tbucket_t *tb, uint16_t rate, uint16_t burst, uint64_t timeout)
 {
 	/*
-	 * The bucket starts full, and with stamp == 1
-	 * (stamp == 0 is reserved as a flag for updating epoch)
+	 * The bucket starts with "burst" tokens, but the actual
+	 * burst size is updated to be at least "rate" before storing
+	 * it in the control word.
 	 */
-	tb->vma_epoch   = gethrtime();
-	tb->vma_timeout = (timeout != 0) ? timeout : VMA_TBUCKET_TIMEOUT;
-	tb->vma_bucket  = VMA_TBUCKET_DEADLINE(1, burst);
-	tb->vma_control = VMA_TBUCKET_CONTROL(rate, burst);
-	return tb->vma_bucket;
+	vma_tbucket_setrate(tb, rate, burst);
+	vma_tbucket_settimeout(tb, timeout);
+	tb->vma_bucket = vma_tbucket_deadline(1, burst);
+	tb->vma_epoch  = gethrtime();
 }
 
 /*
@@ -69,7 +70,7 @@ uint64_t vma_tbucket_init(vma_tbucket_t *tb, uint16_t rate, uint16_t burst, uint
  * scheduled virtual end time, or (-1) if delay is larger than
  * 4 seconds.
  */
-uint64_t vma_get_token(vma_tbucket_t *tb)
+uint64_t vma_do_get_token(vma_tbucket_t *tb)
 {
 	uint64_t vma_control, vma_epoch, vma_bucket;
 	uint64_t winner;
@@ -175,7 +176,7 @@ retry:
 		winner = atomic_cas_64(&(tb->vma_epoch), vma_epoch, now);
 		if (winner == vma_epoch) {
 			membar_producer();
-			tb->vma_bucket = VMA_TBUCKET_DEADLINE(1, burst);
+			tb->vma_bucket = vma_tbucket_deadline(1, burst);
 		}
 		goto retry;
 	}
@@ -218,7 +219,7 @@ retry:
 	 * and we have updated the token count: Safe to update now.
 	 */
 	winner = atomic_cas_64(&(tb->vma_bucket), vma_bucket,
-		VMA_TBUCKET_DEADLINE(stamp, tokens));
+		vma_tbucket_deadline(stamp, tokens));
 	if (winner != vma_bucket) {
 		goto retry;
 	}
@@ -237,31 +238,33 @@ vma_rwstats_init(vma_rwstats_t *sp, uint32_t weight)
 	sp->vma_weight = weight & VMA_STATS_WEIGHTMASK;
 }
 
-void
-vma_stats_update(vma_stats_t *sp, uint32_t weight,
-	uint64_t token, uint32_t disk)
+/*
+ * Computes the weighted average. Although the items are
+ * 64 bits wide, only the 32 LSB must be used in any of them.
+ */
+inline uint64_t average_latency(uint64_t weight, uint64_t avg, uint64_t lat)
+{
+	/* 
+	 * latency is nanosec, but averages are microsecs.
+	 * roughly convert nsec to usec by dividing by 1024
+	 * (shift by 10)
+	 */
+	return (((avg * (weight ^ VMA_STATS_WEIGHTMASK)) +
+		 ((lat >> 10) * (weight))) >> VMA_STATS_WEIGHTBITS);
+}
+
+void vma_stats_update(vma_stats_t *sp, uint32_t weight, uint64_t token, uint64_t disk)
 {
 	/* update drops and delays */
 	if(token == VMA_TBUCKET_DROP)	atomic_inc_32(&(sp->vma_drops));
 	if(token != 0)			atomic_inc_32(&(sp->vma_delays));
-	/* This macro calculates the weighted average for
-	 * a series of uint32_t latency values. */
-#define	AVERAGE_LATENCY(weight, avg, lat)		\
-	((uint32_t) ((					\
-		(((uint64_t) (avg)) * ((weight) ^ VMA_STATS_WEIGHTMASK)) + \
-		(((uint64_t) (lat)) * ((weight)))	\
-	) >> VMA_STATS_WEIGHTBITS))
 	/* update latencies */
 	uint64_t orig, winner = sp->vma_latency;
 	do {
 		orig = winner;
-		/* 
-		 * Tokens are nsec, latency average is usec...
-		 * roughly convert nsec to usec by dividing by 1024
-		 */
-		uint32_t snew = AVERAGE_LATENCY(weight, VMA_STATS_SHAPING(orig), (token >> 10));
-		uint32_t dnew = AVERAGE_LATENCY(weight,	VMA_STATS_DISK(orig), disk);
-		uint64_t lnew = VMA_STATS_LATENCY(snew, dnew);
+		uint64_t snew = average_latency(weight, VMA_STATS_SHAPING(orig), token);
+		uint64_t dnew = average_latency(weight,	VMA_STATS_DISK(orig), disk);
+		uint64_t lnew = vma_stats_latency(snew, dnew);
 		winner = atomic_cas_64(&(sp->vma_latency), orig, lnew);
 	}
 	while(orig != winner);
@@ -287,8 +290,9 @@ int main(int argc, char *argv)
 			tspec.tv_nsec = token % 1000000000l;
 			nanosleep(&tspec, NULL);
 		}
-		vma_rwstats_update(&stats, i&0x01, token, 0);
 		printf("\nTIEMPO DE ESPERA LAPSO %d (%llu): %lld\n", i, token, stop-start);
+		printf("ACTUALIZANDO STATS CON %llu\n", token);
+		vma_rwstats_update(&stats, i&0x01, token, 0);
 		printf("DEADLINE: %lld, TOKENS: %lld\n", VMA_TBUCKET_STAMP(bucket.vma_bucket), VMA_TBUCKET_TOKENS(bucket.vma_bucket));
 	}
 
@@ -296,7 +300,7 @@ int main(int argc, char *argv)
 	tspec.tv_nsec = 0;
 	nanosleep(&tspec, NULL);
 
-	vma_tbucket_reset(&bucket, 5, 10);
+	vma_tbucket_setrate(&bucket, 5, 10);
 	for(i = 0; i < 30; i++) {
 		hrtime_t start = gethrtime();
 		uint64_t token = vma_get_token(&bucket);
@@ -308,9 +312,11 @@ int main(int argc, char *argv)
 		}
 		vma_rwstats_update(&stats, i&0x01, token, 0);
 		printf("\nTIEMPO DE ESPERA LAPSO %d (%llu): %lld\n", i, token, stop-start);
+		printf("ACTUALIZANDO STATS CON %llu\n", token);
+		vma_rwstats_update(&stats, i&0x01, token, 0);
 		printf("DEADLINE: %lld, TOKENS: %lld\n", VMA_TBUCKET_STAMP(bucket.vma_bucket), VMA_TBUCKET_TOKENS(bucket.vma_bucket));
 	}
-	printf("STATS: avg read %u, avg write %u\n", VMA_STATS_SHAPING(VMA_RWSTATS_READ(&stats)->vma_latency), VMA_STATS_SHAPING(VMA_RWSTATS_WRITE(&stats)->vma_latency));
+	printf("STATS: avg read %llu, avg write %llu\n", VMA_STATS_SHAPING(VMA_RWSTATS_READ(&stats)->vma_latency), VMA_STATS_SHAPING(VMA_RWSTATS_WRITE(&stats)->vma_latency));
 	printf("STATS: read drops %u, write drops %u\n", VMA_RWSTATS_READ(&stats)->vma_drops, VMA_RWSTATS_WRITE(&stats)->vma_drops);
 	printf("STATS: read delays %u, write delays %u\n", VMA_RWSTATS_READ(&stats)->vma_delays, VMA_RWSTATS_WRITE(&stats)->vma_delays);
 	return 0;
